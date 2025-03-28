@@ -46,7 +46,7 @@ async def chat_llm(
             ]
         }
     ]
-        return await get_answer(
+        return await llm_answer(
             messages = messages,
             provider = provider,
             model_name = model_name
