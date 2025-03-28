@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from api.v1 import endpoints
 
+
 app = FastAPI(
     swagger_ui_parameters = {"syntaxHighlight.theme": "obsidian"},
     title = "Smart API",

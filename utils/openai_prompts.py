@@ -14,7 +14,7 @@ Return the result with the JSON format like this:
 }
 """
 
-AGENT_PROMPT = """
+SUMMARIZE_PROMPT = """
 You're given a prompt and a JSON that content the structure of an API project.
 Your job is to check wether the query prompt can be retreival via a single function or chain of functions that exist in the given JSON.
 Return the result with two values: True/False, and a dictionary of functions used if True.
@@ -24,4 +24,7 @@ e.g. True,
     "file_name2": [function_name1, function_name3],
     }
 e.g. False, {}
+"""
+
+CHECK_PROMPT = """
 """
