@@ -3,89 +3,157 @@ import aiohttp
 from github import Github, Auth
 from github.GithubException import UnknownObjectException, GithubException
 
+import re
+from ghapi.all import GhApi
+
+
 class GitHubRepo:
     def __init__(self, access_token):
         self.access_token = access_token
         self.github = self.login()
         self.user = self.github.get_user().login
+        self.api  = GhApi(token = access_token)
 
     def login(self):
         auth = Auth.Token(self.access_token)
         return Github(auth=auth)
+
+    def regex_handling(self, repo_name):
+        pattern = r"github\.com/([^/]+/[^/.]+)"
+        if re.search(pattern, repo_name):
+            repo_name = re.search(pattern, repo_name).group(1)
+            repo_name = repo_name.replace(".git", "")
+        
+        return repo_name
 
     async def get_repo(self, repo_name):
         """Async version of get_repo"""
         if "/" not in repo_name:
             repo_name = f"{self.user}/{repo_name}"
         
+        repo_name = self.regex_handling(repo_name = repo_name)
+
+        print(f"Trying to get repo: {repo_name}")
         try:
             return await asyncio.to_thread(self.github.get_repo, repo_name)
-        except UnknownObjectException:
+        except UnknownObjectException as e:
+            print(f"Error finding repo {repo_name}: {str(e)}")
             return None
 
-    async def fetch_files(self, repo, path=""):
-        """Async generator for files"""
-        try:
-            contents = repo.get_contents(path)
-            for content in contents:
-                if content.type == "dir":
-                    async for file_path in self.fetch_files(repo, content.path):
-                        yield file_path
-                else:
-                    yield content.path
-        except Exception as e:
-            print(f"Error fetching contents: {e}")
-
-    async def get_structure(self, repo_name):
+    async def get_branches(self, repo_name, default = False):
         repo = await self.get_repo(repo_name)
-        if not repo:
-            return []
-        return [path async for path in self.fetch_files(repo)]
+        if repo is None:
+            return None
+        
+        if default: return await asyncio.to_thread(lambda: repo.default_branch)
+        branches = await asyncio.to_thread(repo.get_branches)
+        return [branch.name for branch in branches]
     
-    async def get_content(self, repo_name, path):
-        repo = await self.get_repo(repo_name=repo_name)
-        if not repo: 
-            return "Repo not exist"
-        try:
-            file_content = repo.get_contents(path)
-            return file_content.decoded_content.decode("utf-8")
-        except Exception as e:
-            return f"Error fetching this file: {repo_name}/{path}"
-        
-    async def fork_repo(self, repo_name):
-        if "/" not in repo_name:
-            print("Invalid repository format. Use 'owner/repo'.")
+    async def get_structure(self, repo_name, branch = None):
+        repo = await self.get_repo(repo_name = repo_name)
+        if repo is None: 
+            print(f"Repository {repo_name} not found")
             return None
-        
-        _, repo = repo_name.split("/")
-        new_repo_name = f"{self.user}/{repo}"
 
-        # Check if the forked repo already exists
-        if await self.get_repo(new_repo_name):
-            print(f"Fork already exists: {new_repo_name}")
-            return None
-        
-        repo = await self.get_repo(repo_name)
-        if not repo:
-            print("Repository not found.")
-            return None
-        
-        try:
-            forked_repo = repo.create_fork()
-            print(f"Repository forked successfully: {forked_repo.full_name}")
-            return forked_repo.full_name
-        except Exception as e:
-            print(f"Error forking repository: {e}")
-            return None
-        
-    async def get_language(self, repo_name):
-        if "/" not in repo_name:
-            repo_name = f"{self.user}/{repo_name}"
+        if branch is None: 
+            branch = await asyncio.to_thread(lambda: repo.default_branch)
+            print(f"Using default branch: {branch}")
 
-        repo = await self.get_repo(repo_name)
-        if not repo:
+        try:
+            print(f"Getting branch {branch} for repo {repo_name}")
+            branch_obj = await asyncio.to_thread(lambda: repo.get_branch(branch))
+        except Exception as e: 
+            print(f"Error getting branch {branch}: {str(e)}")
+            return None
+
+        commit_sha = branch_obj.commit.sha
+        print(f"Getting tree for commit: {commit_sha}")
+
+        try:
+            tree = await asyncio.to_thread(lambda: repo.get_git_tree(commit_sha, recursive=True))
+        except GithubException as e:
+            print(f"Error getting git tree: {str(e)}")
             return None
         
+        files = [item.path for item in tree.tree if item.type == 'blob']
+        return files
+
+    async def get_files_content(self, repo_name, branch = None, files: list[str] = [], forbidden_extensions=None):
+
+        if not files: 
+            print("No files provided")
+            return None
+
+        # Chuẩn hóa forbidden_extensions
+        if forbidden_extensions:
+            forbidden_extensions = [ext.lower() if not ext.startswith('.') else ext[1:].lower() 
+                                 for ext in forbidden_extensions]
+
+        repo = await self.get_repo(repo_name = repo_name)
+        if repo is None: 
+            print(f"Repository {repo_name} not found")
+            return None
+
+        if branch is None: 
+            branch = await asyncio.to_thread(lambda: repo.default_branch)
+            print(f"Using default branch: {branch}")
+
+        try:
+            # Kiểm tra branch tồn tại
+            await asyncio.to_thread(lambda: repo.get_branch(branch))
+        except Exception as e:
+            print(f"Branch {branch} not found: {str(e)}")
+            return None
+        
+        available_files = await self.get_structure(repo_name = repo_name, branch = branch)
+        if available_files is None:
+            print(f"Could not get structure for repository {repo_name} branch {branch}")
+            return None
+
+        file_contents = {}
+
+        for file in files:
+            # Kiểm tra file có tồn tại trong repo không
+            if file not in available_files:
+                print(f"File {file} not found in repository {repo_name}")
+                file_contents[file] = None
+                continue
+
+            # Kiểm tra extension có bị cấm không
+            if forbidden_extensions:
+                file_ext = file.split('.')[-1].lower() if '.' in file else ''
+                if file_ext in forbidden_extensions:
+                    print(f"File {file} has forbidden extension {file_ext}")
+                    file_contents[file] = None
+                    continue
+
+            try:
+                content = await asyncio.to_thread(lambda: repo.get_contents(file, ref=branch))
+                
+                # Kiểm tra kích thước file
+                if content.size > 1024 * 1024:  # Lớn hơn 1MB
+                    print(f"File {file} is too large ({content.size} bytes)")
+                    file_contents[file] = None
+                    continue
+
+                try:
+                    file_contents[file] = content.decoded_content.decode("utf-8")
+                    print(f"Successfully retrieved content for {file}")
+                except UnicodeDecodeError:
+                    print(f"File {file} is not a text file")
+                    file_contents[file] = None
+            except Exception as e:
+                print(f"Error getting content for {file}: {str(e)}")
+                file_contents[file] = None
+
+        return file_contents
+
+    async def get_langauges(self, repo_name):
+        if "/" not in repo_name: repo_name = f"{self.user}/{repo_name}"
+
+        repo = await self.get_repo(repo_name = repo_name)
+        if repo is None: return None
+
         try:
             languages = await asyncio.to_thread(repo.get_languages)
             total_bytes = sum(languages.values())
@@ -96,208 +164,200 @@ class GitHubRepo:
         except Exception as e:
             print(f"Error getting languages: {e}")
             return None
-        
-    async def write_code(
-        self,
-        repo_name: str,
-        branch: str = "dev",
-        files: dict = {},
-        commit_message: str = "",
-    ):
+
+    async def get_commit_history(self, repo_name, branch=None, file_path=None):
+        repo_name = self.regex_handling(repo_name = repo_name)
         
         try:
-            repo = await self.get_repo(repo_name)
-            if not repo:    return False
+            # Xử lý repo_name để lấy owner và repo
+            owner, repo = repo_name.split('/') if '/' in repo_name else (self.user, repo_name)
+            
+            # Xác định branch nếu không được cung cấp
+            if branch is None:
+                repo_obj = await self.get_repo(repo_name)
+                if repo_obj is None:
+                    print(f"Repository {repo_name} not found")
+                    return None
+                
+                branch = await asyncio.to_thread(lambda: repo_obj.default_branch)
+                print(f"Using default branch: {branch}")
 
-            try:
-                ref = await asyncio.to_thread(repo.get_git_ref, f"heads/{branch}")
-                base_sha = repo.get_branch(branch).commit.sha
-            except UnknownObjectException:
-                if branch != "dev": return False
-                default_branch = await asyncio.to_thread(lambda: repo.default_branch)
-                base_sha = repo.get_branch(default_branch).commit.sha
-                ref = await asyncio.to_thread(repo.create_git_ref, f"refs/heads/{branch}", base_sha)
-
-            blobs = {}
-            for path, content in files.items():
-                blob = await asyncio.to_thread(repo.create_git_blob, content, "utf-8")
-                blobs[path] = blob.sha
-
-            commit = await asyncio.to_thread(repo.get_git_commit, base_sha)
-            tree = await asyncio.to_thread(
-                repo.create_git_tree,
-                [{
-                    "path": path,
-                    "mode": "100644",
-                    "type": "blob",
-                    "sha": sha
-                } for path, sha in blobs.items()],
-                base_tree=commit.tree
-            )
-
-            new_commit = await asyncio.to_thread(
-                repo.create_git_commit,
-                commit_message,
-                tree.sha,
-                [commit.sha]
-            )
-
-            # Update branch
-            await asyncio.to_thread(ref.edit, new_commit.sha)
-            return True
-
-        except Exception as e:
-            print(f"Error writing code: {str(e)}")
-            return False
-
-    async def get_default_branch(self, repo_name: str):
-        repo = await self.get_repo(repo_name = repo_name)
-        return repo.default_branch if repo else None
-     
-    async def merge_branch(
-        self,
-        repo_name: str,
-        head_branch: str,     # mostly dev
-        base_branch: str,     # mostly main/master - default branch
-        commit_message: str = "Merge branches via API"
-    ) -> bool:
-        try:
-            repo = await self.get_repo(repo_name)
-            if not repo:    return False
-
-            if not base_branch: base_branch = await self.get_default_branch(repo_name)
-
-            head_ref = await asyncio.to_thread(repo.get_git_ref, f"heads/{head_branch}")
-            base_ref = await asyncio.to_thread(repo.get_git_ref, f"heads/{base_branch}")
-
-            merge_result = await asyncio.to_thread(
-                repo.merge,
-                base_ref.ref,
-                head_ref.object.sha,
-                commit_message
-            )
-
-            return merge_result is not None
-        
-        except GithubException as e:
-            print(f"Reset failed: {e.data.get('message', 'Unknown error')}")
-            return False
-        except Exception as e:
-            print(f"Error resetting branch: {str(e)}")
-            return False
-        
-    async def revert_to_commit(
-        self,
-        repo_name: str,
-        commit_sha: str,
-        branch: str = None
-    ) -> bool:
-        """
-        Revert to a specific commit in the repository's history
-        :param commit_sha: The commit SHA to revert to
-        :param branch: Target branch to update (defaults to default branch)
-        """
-        try:
-            repo = await self.get_repo(repo_name)
-            if not repo:
-                return False
-
-            if not branch:
-                branch = await self.get_default_branch(repo_name)
-
-            # GitHub API endpoint for reverting commits
-            url = f"https://api.github.com/repos/{repo_name}/commits/{commit_sha}/revert"
-            headers = {
-                "Authorization": f"token {self.access_token}",
-                "Accept": "application/vnd.github.v3+json"
-            }
-            data = {"branch": branch}
-
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=data, headers=headers) as response:
-                    if response.status == 201:
-                        print(f"Reverted to commit {commit_sha} on branch {branch}")
-                        return True
+            if file_path is None:
+                # Lấy lịch sử commit của toàn bộ repo
+                try:
+                    commits = await asyncio.to_thread(
+                        lambda: list(self.github.get_repo(repo_name).get_commits(sha=branch))
+                    )
+                    commit_history = {
+                        commit.sha: commit.commit.message
+                        for commit in commits
+                    }
+                    print(f"Retrieved {len(commit_history)} commits from repository")
+                    return commit_history
+                except Exception as e:
+                    print(f"Error getting repository commit history: {str(e)}")
+                    return None
+            else:
+                # Kiểm tra file có tồn tại không
+                try:
+                    file_content = self.api.repos.get_content(
+                        owner=owner,
+                        repo=repo,
+                        path=file_path,
+                        ref=branch
+                    )
+                    print(f"Found file: {file_path}")
+                except Exception as e:
+                    print(f"File {file_path} not found: {str(e)}")
+                    return None
                     
-                    error = await response.json()
-                    print(f"Revert failed: {error.get('message', 'Unknown error')}")
-                    return False
+                # Lấy lịch sử commit của file với phân trang
+                try:
+                    all_commits = []
+                    page = 1
+                    per_page = 100  # Số lượng commit tối đa cho mỗi trang
+                    
+                    while True:
+                        commits = self.api.repos.list_commits(
+                            owner=owner,
+                            repo=repo,
+                            sha=branch,
+                            path=file_path,
+                            per_page=per_page,
+                            page=page
+                        )
+                        
+                        if not commits:  # Không còn commit nào nữa
+                            break
+                            
+                        all_commits.extend(commits)
+                        print(f"Retrieved {len(commits)} commits from page {page}")
+                        
+                        if len(commits) < per_page:  # Đã lấy hết tất cả commit
+                            break
+                            
+                        page += 1
+                    
+                    commit_history = {
+                        commit['sha']: commit['commit']['message']
+                        for commit in all_commits
+                    }
+                    
+                    print(f"Total commits retrieved for file: {len(commit_history)}")
+                    return commit_history
+                    
+                except Exception as e:
+                    print(f"Error getting commit history for file {file_path}: {str(e)}")
+                    return None
 
         except Exception as e:
-            print(f"Error reverting commit: {str(e)}")
-            return False
+            print(f"Error in get_commit_history: {str(e)}")
+            return None
+
+    async def get_commit_changes(
+        self, 
+        repo_name, 
+        branch=None, 
+        file_path=None, 
+        commit_id=None
+    ):
+        repo_name = self.regex_handling(repo_name=repo_name)
         
-    async def get_commit_list(self, repo_name: str, branch: str = None, limit: int = 30) -> list:
         try:
-            repo = await self.get_repo(repo_name)
-            if not repo:
-                return []
+            owner, repo = repo_name.split('/') if '/' in repo_name else (self.user, repo_name)
+            
+            # Xác định branch mặc định
+            if branch is None:
+                repo_obj = await self.get_repo(repo_name)
+                if not repo_obj:
+                    print(f"Repository {repo_name} not found")
+                    return None
+                branch = repo_obj.default_branch
+                print(f"Using default branch: {branch}")
 
-            if not branch:
-                branch = await self.get_default_branch(repo_name)
-
-            commits = []
-            async for commit in await asyncio.to_thread(
-                lambda: repo.get_commits(sha=branch)[:limit]
-            ):
-                commits.append({
-                    "sha": commit.sha,
-                    "message": commit.commit.message,
-                    "author": commit.author.login if commit.author else "Unknown",
-                    "date": commit.commit.author.date
-                })
-
-            return commits
-
-        except Exception as e:
-            print(f"Error getting commits: {str(e)}")
-            return []
-        
-    async def navigate_commits(self, repo_name: str, steps: int = 1, branch: str = None) -> bool:
-        """
-        Move branch pointer backward/forward in commit history
-        :param steps: Positive numbers go forward, negative go backward
-        """
-        try:
-            commits = await self.get_commit_list(repo_name, branch)
-            if not commits:
-                return False
-
-            current_index = 0  # Latest commit is always index 0
-            target_index = current_index + steps
-
-            if target_index < 0 or target_index >= len(commits):
-                print(f"Invalid step count: {steps}")
-                return False
-
-            return await self.reset_branch(
-                repo_name,
-                branch or await self.get_default_branch(repo_name),
-                commits[target_index]["sha"]
+            # Lấy lịch sử commit
+            commit_history = await self.get_commit_history(
+                repo_name=repo_name,
+                branch=branch,
+                file_path=file_path
             )
+            
+            if not commit_history:
+                print("No commit history found")
+                return None
+
+            # Xác định commit mục tiêu
+            target_commit = commit_id if commit_id else next(iter(commit_history))
+            if target_commit not in commit_history:
+                print(f"Commit {target_commit} not found")
+                return None
+
+            # Lấy thông tin commit
+            try:
+                commit = await asyncio.to_thread(
+                    lambda: self.api.repos.get_commit(
+                        owner=owner,
+                        repo=repo,
+                        ref=target_commit
+                    )
+                )
+            except Exception as e:
+                print(f"Error getting commit: {str(e)}")
+                return None
+
+            # Chuẩn hóa đường dẫn thư mục
+            normalized_path = file_path.rstrip('/') + '/' if file_path else ''
+            
+            # Xử lý từng file trong commit
+            result = {
+                "commit_id": target_commit,
+                "message": commit.commit.message,
+                "date": commit.commit.author.date,
+                "author": {
+                    "name": commit.commit.author.name,
+                    "email": commit.commit.author.email
+                },
+                "files": {}
+            }
+
+            for file in commit.files:
+                try:
+                    # Kiểm tra file thuộc thư mục đích (nếu có)
+                    if file_path:
+                        if not file.filename.startswith(normalized_path):
+                            continue
+
+                    # Lấy nội dung file tại commit này
+                    content = ""
+                    if file.status != "removed":
+                        try:
+                            content_res = await asyncio.to_thread(
+                                lambda: self.api.repos.get_content(
+                                    owner=owner,
+                                    repo=repo,
+                                    path=file.filename,
+                                    ref=target_commit
+                                )
+                            )
+                            content = self._decode_content(content_res.content)
+                        except Exception as e:
+                            print(f"Error getting content for {file.filename}: {str(e)}")
+
+                    # Thêm thông tin thay đổi
+                    result["files"][file.filename] = {
+                        "status": file.status,
+                        "changes": file.changes,
+                        "additions": file.additions,
+                        "deletions": file.deletions,
+                        "content": content,
+                        "patch": getattr(file, "patch", None)
+                    }
+
+                except Exception as e:
+                    print(f"Error processing {file.filename}: {str(e)}")
+
+            return result if result["files"] else None
 
         except Exception as e:
-            print(f"Navigation error: {str(e)}")
-            return False
-        
-    async def reset_branch(self, repo_name: str, branch: str, commit_sha: str) -> bool:
-        """
-        Force reset a branch to a specific commit
-        WARNING: This is a destructive operation!
-        """
-        try:
-            repo = await self.get_repo(repo_name)
-            if not repo:
-                return False
-
-            ref = await asyncio.to_thread(repo.get_git_ref, f"heads/{branch}")
-            await asyncio.to_thread(ref.edit, commit_sha)
-            print(f"Reset {branch} to commit {commit_sha}")
-            return True
-
-        except GithubException as e:
-            print(f"Reset failed: {e.data.get('message', 'Unknown error')}")
-            return False
-        except Exception as e:
-            print(f"Error resetting branch: {str(e)}")
-            return False
+            print(f"Critical error: {str(e)}")
+            return None

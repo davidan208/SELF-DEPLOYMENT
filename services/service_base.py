@@ -28,7 +28,7 @@ async def chat_llm(
     if not history:
         messages = [
         {
-            "role": "user",
+            "role": "system",
             "content": [
                 {
                     "type": "text",
@@ -71,10 +71,5 @@ async def chat_llm(
             model_name = model_name
         )
 
-async def understand_repo(
-    user_query: str,
-    provider: Literal["gemini", "openai", "claude", "deepseek"] = "openai",
-    model_name: str = "4o-mini",
-    history: Optional[List[Dict]] = None,
-):
+async def retrieve_repo_info():
     ...
